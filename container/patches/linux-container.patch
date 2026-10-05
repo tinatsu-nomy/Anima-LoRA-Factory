@@ -1,0 +1,622 @@
+diff --git a/backend/main.py b/backend/main.py
+index e646370..f3ffec5 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,8 +10,7 @@ import toml
+ import json
+ import glob
+ import asyncio
+-import tkinter as tk
+-from tkinter import filedialog
++from pathlib import Path
+ 
+ app = FastAPI()
+ 
+@@ -20,26 +19,93 @@ def get_cuda_training_error():
+     try:
+         import torch
+     except Exception as e:
+-        return f"PyTorchの読み込みに失敗しました。start.batを再実行してください。 / Failed to load PyTorch: {e}"
++        return f"PyTorchの読み込みに失敗しました。コンテナイメージを再ビルドしてください。 / Failed to load PyTorch; rebuild the container image: {e}"
+ 
+     if not torch.cuda.is_available():
+         return (
+             "NVIDIA GPUをPyTorchから使用できません。CPUでの停止を防ぐため学習を開始しませんでした。"
+-            "venvフォルダを削除してstart.batを再実行してください。 / "
+-            "PyTorch cannot use the NVIDIA GPU. Delete the venv folder and run start.bat again."
++            "NVIDIA Container ToolkitとGPU割り当てを確認してください。 / "
++            "PyTorch cannot use the NVIDIA GPU. Check NVIDIA Container Toolkit and GPU allocation."
+         )
+     return None
+ 
+-# Initialize tkinter for folder dialog
+-root = tk.Tk()
+-root.withdraw() # Hide main window
+-root.attributes('-topmost', True) # Bring dialog to front
+-
+ # Supported image extensions
+ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+ HISTORY_PATH = os.path.join(DATA_DIR, "training_history.json")
+ HISTORY_LIMIT = 30
++FILE_BROWSER_ROOTS = {
++    "datasets": Path("/workspace/datasets"),
++    "models": Path("/workspace/models"),
++    "output": Path("/workspace/output"),
++}
++
++
++def resolve_browser_path(root_name: str, relative_path: str = ""):
++    root_path = FILE_BROWSER_ROOTS.get(root_name)
++    if root_path is None:
++        raise HTTPException(status_code=400, detail="Unknown browser root")
++
++    root_path = root_path.resolve()
++    requested_path = (root_path / relative_path).resolve()
++    try:
++        requested_path.relative_to(root_path)
++    except ValueError:
++        raise HTTPException(status_code=403, detail="Path is outside the allowed root")
++
++    if not requested_path.is_dir():
++        raise HTTPException(status_code=404, detail="Directory not found")
++    return root_path, requested_path
++
++
++@app.get("/api/fs/list")
++async def list_browser_directory(root: str, path: str = ""):
++    root_path, current_path = resolve_browser_path(root, path)
++    entries = []
++    try:
++        children = sorted(
++            current_path.iterdir(),
++            key=lambda item: (not item.is_dir(), item.name.casefold()),
++        )
++        for item in children:
++            if item.name.startswith("."):
++                continue
++            resolved_item = item.resolve()
++            try:
++                resolved_item.relative_to(root_path)
++            except ValueError:
++                continue
++
++            is_directory = item.is_dir()
++            if not is_directory and (root != "models" or item.suffix.lower() != ".safetensors"):
++                continue
++            entries.append(
++                {
++                    "name": item.name,
++                    "is_dir": is_directory,
++                    "relative_path": resolved_item.relative_to(root_path).as_posix(),
++                    "container_path": resolved_item.as_posix(),
++                }
++            )
++    except PermissionError:
++        raise HTTPException(status_code=403, detail="Directory is not readable")
++
++    current_relative = current_path.relative_to(root_path).as_posix()
++    if current_relative == ".":
++        current_relative = ""
++    parent_relative = None
++    if current_path != root_path:
++        parent_relative = current_path.parent.relative_to(root_path).as_posix()
++        if parent_relative == ".":
++            parent_relative = ""
++
++    return {
++        "root": root,
++        "current_path": current_path.as_posix(),
++        "relative_path": current_relative,
++        "parent_relative_path": parent_relative,
++        "entries": entries,
++    }
+ 
+ def count_dataset_images(path):
+     if not path or not os.path.exists(path):
+@@ -266,7 +332,7 @@ async def start_training(config: TrainingConfig, script_path: str = ""):
+         return {"status": "error", "message": "Qwen3テキストエンコーダーのパスが指定されていません。Animaの学習にはQwen3が必要です。"}
+ 
+     # Generate dataset TOML
+-    toml_path = os.path.join(os.getcwd(), "dataset_config.toml")
++    toml_path = os.path.join(DATA_DIR, "dataset_config.toml")
+     try:
+         generate_dataset_toml(config.path, toml_path, max(config.repeats, 1))
+         training_logs += f"Generated dataset config at {toml_path}\n"
+@@ -396,9 +462,10 @@ async def train_and_convert_task(config: TrainingConfig, command: list, script_p
+         await broadcast_log("\n--- All Processes Finished Successfully ---\n", "train")
+         
+         if config.shutdown:
+-            await broadcast_log("\n⚠️ シャットダウン命令を受信しました。60秒後にPCをシャットダウンします。\n", "train")
+-            await broadcast_log("中止する場合はコマンドプロンプトで 'shutdown /a' と入力してください。\n", "train")
+-            os.system("shutdown /s /t 60")
++            await broadcast_log(
++                "\n[INFO] Automatic host shutdown is disabled in the container build.\n",
++                "train",
++            )
+         
+     except Exception as e:
+         await broadcast_log(f"Critical Error in process chain: {str(e)}\n", "train")
+@@ -420,28 +487,17 @@ async def run_and_capture(process, type):
+ 
+ @app.get("/api/browse-folder")
+ async def browse_folder():
+-    try:
+-        # Open folder dialog
+-        folder_path = filedialog.askdirectory(title="Select Folder")
+-        if folder_path:
+-            return {"path": folder_path}
+-        return {"path": ""}
+-    except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e))
++    return {
++        "path": "",
++        "message": "Desktop file dialogs are disabled. Enter a /workspace path manually.",
++    }
+ 
+ @app.get("/api/browse-file")
+ async def browse_file():
+-    try:
+-        # Open file dialog
+-        file_path = filedialog.askopenfilename(
+-            title="Select Base Model",
+-            filetypes=[("Safetensors", "*.safetensors"), ("All Files", "*.*")]
+-        )
+-        if file_path:
+-            return {"path": file_path}
+-        return {"path": ""}
+-    except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e))
++    return {
++        "path": "",
++        "message": "Desktop file dialogs are disabled. Enter a /workspace path manually.",
++    }
+ 
+ @app.get("/api/gpu-info")
+ async def get_gpu_info():
+@@ -472,17 +528,10 @@ async def check_scripts():
+ 
+ @app.post("/api/setup-scripts")
+ async def setup_scripts():
+-    internal_scripts = os.path.join(os.path.dirname(__file__), "sd-scripts")
+-    if os.path.exists(internal_scripts):
+-        # Even if it exists, let's allow running pip install again if needed
+-        # but for now, let's just trigger the task
+-        pass
+-    
+-    try:
+-        asyncio.create_task(setup_scripts_task(internal_scripts))
+-        return {"status": "started", "message": "Setup started..."}
+-    except Exception as e:
+-        return {"status": "error", "message": f"Error: {str(e)}"}
++    return {
++        "status": "exists",
++        "message": "Dependencies are baked into the container image. Rebuild the image to repair them.",
++    }
+ 
+ async def setup_scripts_task(internal_scripts: str):
+     import sys
+@@ -637,8 +686,9 @@ def capture_logs(process):
+         if len(training_logs) > 10000: # Limit log size
+             training_logs = training_logs[-10000:]
+ 
+-# Serve frontend
+-app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
++# Serve frontend using an absolute path so startup does not depend on cwd.
++FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
++app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+ 
+ if __name__ == "__main__":
+     import uvicorn
+diff --git a/frontend/app.js b/frontend/app.js
+index 4d5539d..7ebe68d 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+@@ -17,34 +17,106 @@ document.querySelectorAll('.nav-item').forEach(item => {
+     });
+ });
+ 
+-async function browseFolder() {
+-    const response = await fetch('/api/browse-folder');
+-    const data = await response.json();
+-    if (data.path) {
+-        document.getElementById('dataset-path').value = data.path;
+-        refreshDatasetImageCount();
+-    }
+-}
+-
+-async function browseFile(inputId, titleStr) {
+-    const response = await fetch(`/api/browse-file?title=${encodeURIComponent(titleStr)}`);
+-    const data = await response.json();
+-    if (data.path) {
+-        const input = document.getElementById(inputId);
+-        input.value = data.path;
+-        localStorage.setItem(`anima_factory_${inputId}`, data.path);
+-    }
+-}
+-
+-async function browseOutput() {
+-    const response = await fetch('/api/browse-folder');
+-    const data = await response.json();
+-    if (data.path) {
+-        const input = document.getElementById('output-dir');
+-        input.value = data.path;
+-        localStorage.setItem('anima_factory_OutputDir', data.path);
+-    }
+-}
++const pathBrowserState = {
++    inputId: '',
++    root: '',
++    mode: 'file',
++    currentPath: '',
++    selectedPath: '',
++};
++
++async function openPathBrowser(inputId, root, mode, title) {
++    pathBrowserState.inputId = inputId;
++    pathBrowserState.root = root;
++    pathBrowserState.mode = mode;
++    pathBrowserState.currentPath = '';
++    pathBrowserState.selectedPath = '';
++    document.getElementById('path-browser-title').textContent = title;
++    const modal = document.getElementById('path-browser-modal');
++    modal.classList.add('open');
++    modal.setAttribute('aria-hidden', 'false');
++    await loadPathBrowserDirectory('');
++}
++
++async function loadPathBrowserDirectory(relativePath) {
++    const list = document.getElementById('path-browser-list');
++    const error = document.getElementById('path-browser-error');
++    const selectButton = document.getElementById('path-browser-select');
++    list.replaceChildren();
++    error.hidden = true;
++    list.textContent = '読み込み中... / Loading...';
++
++    try {
++        const params = new URLSearchParams({root: pathBrowserState.root, path: relativePath});
++        const response = await fetch(`/api/fs/list?${params}`);
++        if (!response.ok) {
++            const detail = await response.json();
++            throw new Error(detail.detail || `HTTP ${response.status}`);
++        }
++        const data = await response.json();
++        pathBrowserState.currentPath = data.current_path;
++        pathBrowserState.selectedPath = pathBrowserState.mode === 'directory' ? data.current_path : '';
++        document.getElementById('path-browser-current').textContent = data.current_path;
++        selectButton.disabled = pathBrowserState.mode === 'file';
++        list.replaceChildren();
++
++        if (data.parent_relative_path !== null) {
++            list.appendChild(createPathBrowserEntry('📁 ..', true, () => {
++                loadPathBrowserDirectory(data.parent_relative_path);
++            }));
++        }
++
++        for (const entry of data.entries) {
++            const label = `${entry.is_dir ? '📁' : '📄'} ${entry.name}`;
++            const row = createPathBrowserEntry(label, entry.is_dir, () => {
++                if (entry.is_dir) {
++                    loadPathBrowserDirectory(entry.relative_path);
++                } else {
++                    document.querySelectorAll('.path-browser-entry').forEach(item => item.classList.remove('selected'));
++                    row.classList.add('selected');
++                    pathBrowserState.selectedPath = entry.container_path;
++                    selectButton.disabled = false;
++                }
++            });
++            list.appendChild(row);
++        }
++
++        if (data.entries.length === 0) {
++            const empty = document.createElement('p');
++            empty.className = 'path-browser-empty';
++            empty.textContent = '選択可能な項目がありません / No selectable entries';
++            list.appendChild(empty);
++        }
++    } catch (exception) {
++        list.replaceChildren();
++        error.textContent = exception.message;
++        error.hidden = false;
++        selectButton.disabled = true;
++    }
++}
++
++function createPathBrowserEntry(label, isDirectory, handler) {
++    const button = document.createElement('button');
++    button.type = 'button';
++    button.className = `path-browser-entry${isDirectory ? ' directory' : ' file'}`;
++    button.textContent = label;
++    button.addEventListener('click', handler);
++    return button;
++}
++
++function confirmPathBrowserSelection() {
++    if (!pathBrowserState.selectedPath) return;
++    const input = document.getElementById(pathBrowserState.inputId);
++    input.value = pathBrowserState.selectedPath;
++    input.dispatchEvent(new Event('change', {bubbles: true}));
++    closePathBrowser();
++}
++
++function closePathBrowser() {
++    const modal = document.getElementById('path-browser-modal');
++    modal.classList.remove('open');
++    modal.setAttribute('aria-hidden', 'true');
++}
+ 
+ function toggleAdvancedSettings() {
+     const isChecked = document.getElementById('enable-advanced').checked;
+@@ -89,13 +161,13 @@ async function loadGPUInfo() {
+ }
+ 
+ async function checkScriptsStatus() {
+-    const response = await fetch('/api/check-scripts');
+-    const data = await response.json();
+-    if (data.exists) {
+-        const btn = document.getElementById('setup-scripts-btn');
+-        btn.innerText = '✅ エンジン取得済み（再インストール可能） / Ready (click to reinstall deps)';
+-        btn.disabled = false;
+-        btn.style.opacity = '1';
++    const response = await fetch('/api/check-scripts');
++    const data = await response.json();
++    if (data.exists) {
++        const btn = document.getElementById('setup-scripts-btn');
++        btn.innerText = '✅ コンテナイメージに構築済み / Ready in container image';
++        btn.disabled = true;
++        btn.style.opacity = '1';
+         btn.style.background = 'rgba(52, 211, 153, 0.2)';
+         btn.style.borderColor = '#34d499';
+     }
+diff --git a/frontend/index.html b/frontend/index.html
+index 903c92e..faa4da2 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -6,7 +6,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>Anima LoRA Factory</title>
+     <link rel="icon" href="assets/favicon.ico">
+-    <link rel="stylesheet" href="style.css?v=5.1.0">
++    <link rel="stylesheet" href="style.css?v=5.1.0-container.1">
+ </head>
+ 
+ <body>
+@@ -80,10 +80,9 @@
+                 <div class="form-group">
+                     <label>画像フォルダのパス (Dataset Path)</label>
+                     <div style="display: flex; gap: 0.5rem;">
+-                        <input type="text" id="dataset-path" placeholder="C:\path\to\your\images">
+-                        <button class="btn btn-secondary"
+-                            style="background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: white;"
+-                            onclick="browseFolder()">参照 (Browse)</button>
++                        <input type="text" id="dataset-path" value="/workspace/datasets" placeholder="/workspace/datasets">
++                        <button class="btn btn-secondary path-browser-button"
++                            onclick="openPathBrowser('dataset-path', 'datasets', 'directory', '画像フォルダを選択 / Select Dataset Directory')">選択 / Select</button>
+                     </div>
+                 </div>
+                 <button class="btn btn-primary" onclick="validatePath()">次へ進む / Next Step</button>
+@@ -222,37 +221,33 @@
+                 <div class="form-group">
+                     <label>Animaベースモデルのパス / Anima Base Model Path (.safetensors)</label>
+                     <div style="display: flex; gap: 0.5rem;">
+-                        <input type="text" id="model-path" placeholder="C:\path\to\anima-preview3-base.safetensors">
+-                        <button class="btn btn-secondary"
+-                            style="background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: white;"
+-                            onclick="browseFile('model-path', 'Select Base Model')">参照 / Browse</button>
++                        <input type="text" id="model-path" placeholder="/workspace/models/anima-base-v1.0.safetensors">
++                        <button class="btn btn-secondary path-browser-button"
++                            onclick="openPathBrowser('model-path', 'models', 'file', 'ベースモデルを選択 / Select Base Model')">選択 / Select</button>
+                     </div>
+                 </div>
+                 <div class="form-group">
+                     <label>VAEのパス / VAE Path (.safetensors)</label>
+                     <div style="display: flex; gap: 0.5rem;">
+-                        <input type="text" id="vae-path" placeholder="C:\path\to\anima-preview3-vae.safetensors">
+-                        <button class="btn btn-secondary"
+-                            style="background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: white;"
+-                            onclick="browseFile('vae-path', 'Select VAE')">参照 / Browse</button>
++                        <input type="text" id="vae-path" placeholder="/workspace/models/qwen_image_vae.safetensors">
++                        <button class="btn btn-secondary path-browser-button"
++                            onclick="openPathBrowser('vae-path', 'models', 'file', 'VAEを選択 / Select VAE')">選択 / Select</button>
+                     </div>
+                 </div>
+                 <div class="form-group">
+                     <label>Qwen3テキストエンコーダーのパス / Qwen3 Text Encoder Path</label>
+                     <div style="display: flex; gap: 0.5rem;">
+-                        <input type="text" id="qwen-path" placeholder="C:\path\to\qwen3_06b_anima.safetensors">
+-                        <button class="btn btn-secondary"
+-                            style="background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: white;"
+-                            onclick="browseFile('qwen-path', 'Select Qwen3')">参照 / Browse</button>
++                        <input type="text" id="qwen-path" placeholder="/workspace/models/qwen_3_06b_base.safetensors">
++                        <button class="btn btn-secondary path-browser-button"
++                            onclick="openPathBrowser('qwen-path', 'models', 'file', 'Qwen3を選択 / Select Qwen3')">選択 / Select</button>
+                     </div>
+                 </div>
+                 <div class="form-group">
+                     <label>出力先フォルダ / Output Directory</label>
+                     <div style="display: flex; gap: 0.5rem;">
+-                        <input type="text" id="output-dir" placeholder="C:\path\to\output">
+-                        <button class="btn btn-secondary"
+-                            style="background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: white;"
+-                            onclick="browseOutput()">参照 / Browse</button>
++                        <input type="text" id="output-dir" value="/workspace/output" placeholder="/workspace/output">
++                        <button class="btn btn-secondary path-browser-button"
++                            onclick="openPathBrowser('output-dir', 'output', 'directory', '出力先を選択 / Select Output Directory')">選択 / Select</button>
+                     </div>
+                 </div>
+                 <div class="form-group">
+@@ -454,8 +449,8 @@
+                 <!-- Repair Section -->
+                 <div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px dashed var(--glass-border);">
+                     <h4 style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">🛠️ トラブルシューティング (Troubleshooting)</h4>
+-                    <button id="setup-scripts-btn" class="btn btn-secondary" style="font-size: 0.75rem; width: 100%;"
+-                        onclick="setupScripts()">学習環境の再構築 (環境を修復する) / Repair Environment</button>
++                    <button id="setup-scripts-btn" class="btn btn-secondary" style="font-size: 0.75rem; width: 100%;" disabled>
++                        コンテナイメージに構築済み / Baked into container image</button>
+                     <p id="setup-progress-text" style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 0.4rem; display: none; text-align: center;">
+                         ⏳ 修復中です。しばらくお待ちください... / Repairing, please wait...
+                     </p>
+@@ -485,11 +480,7 @@
+                             <input type="checkbox" id="keep-unet" style="width: auto;">
+                             <span>UNET版モデル（中間ファイル）を削除せずに残す / Keep UNET file</span>
+                         </label>
+-                        <label
+-                            style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem; user-select: none;">
+-                            <input type="checkbox" id="auto-shutdown" style="width: auto;">
+-                            <span>トレーニング完了後にPCをシャットダウンする / Shutdown after completion</span>
+-                        </label>
++                        <input type="checkbox" id="auto-shutdown" style="display: none;" disabled>
+                     </div>
+                 </div>
+             </div>
+@@ -512,7 +503,27 @@
+         </div>
+     </div>
+ 
+-    <script src="app.js?v=5.1.0"></script>
++    <div id="path-browser-modal" class="path-browser-modal" aria-hidden="true">
++        <div class="path-browser-panel" role="dialog" aria-modal="true" aria-labelledby="path-browser-title">
++            <div class="path-browser-header">
++                <div>
++                    <h2 id="path-browser-title">Select path</h2>
++                    <p id="path-browser-current">/workspace</p>
++                </div>
++                <button class="history-close" onclick="closePathBrowser()" aria-label="Close">×</button>
++            </div>
++            <div id="path-browser-error" class="path-browser-error" hidden></div>
++            <div id="path-browser-list" class="path-browser-list"></div>
++            <div class="path-browser-actions">
++                <button class="btn btn-secondary" onclick="closePathBrowser()">キャンセル / Cancel</button>
++                <button id="path-browser-select" class="btn btn-primary" onclick="confirmPathBrowserSelection()">
++                    この項目を選択 / Select
++                </button>
++            </div>
++        </div>
++    </div>
++
++    <script src="app.js?v=5.1.0-container.1"></script>
+ </body>
+ 
+ </html>
+diff --git a/frontend/style.css b/frontend/style.css
+index 6896c07..0a80732 100644
+--- a/frontend/style.css
++++ b/frontend/style.css
+@@ -344,6 +344,117 @@ input:focus {
+         width: 100%;
+     }
+ }
++
++.path-browser-button {
++    background: rgba(255, 255, 255, 0.1);
++    border: 1px solid var(--glass-border);
++    color: white;
++    flex: 0 0 auto;
++    white-space: nowrap;
++}
++
++.path-browser-modal {
++    align-items: center;
++    background: rgba(2, 6, 23, 0.82);
++    display: none;
++    inset: 0;
++    justify-content: center;
++    padding: 1rem;
++    position: fixed;
++    z-index: 1100;
++}
++
++.path-browser-modal.open {
++    display: flex;
++}
++
++.path-browser-panel {
++    background: #111827;
++    border: 1px solid var(--glass-border);
++    border-radius: 0.75rem;
++    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
++    display: flex;
++    flex-direction: column;
++    max-height: min(80vh, 720px);
++    max-width: 760px;
++    padding: 1rem;
++    width: 100%;
++}
++
++.path-browser-header {
++    align-items: flex-start;
++    display: flex;
++    gap: 1rem;
++    justify-content: space-between;
++    margin-bottom: 0.85rem;
++}
++
++.path-browser-header h2 {
++    font-size: 1.05rem;
++    margin-bottom: 0.3rem;
++}
++
++#path-browser-current {
++    color: #93c5fd;
++    font-family: monospace;
++    font-size: 0.78rem;
++    overflow-wrap: anywhere;
++}
++
++.path-browser-list {
++    background: rgba(2, 6, 23, 0.55);
++    border: 1px solid rgba(148, 163, 184, 0.22);
++    border-radius: 0.5rem;
++    display: flex;
++    flex: 1;
++    flex-direction: column;
++    min-height: 240px;
++    overflow-y: auto;
++    padding: 0.4rem;
++}
++
++.path-browser-entry {
++    background: transparent;
++    border: 1px solid transparent;
++    border-radius: 0.4rem;
++    color: var(--text-primary);
++    cursor: pointer;
++    font-size: 0.86rem;
++    padding: 0.65rem 0.75rem;
++    text-align: left;
++    width: 100%;
++}
++
++.path-browser-entry:hover {
++    background: rgba(96, 165, 250, 0.12);
++}
++
++.path-browser-entry.selected {
++    background: rgba(59, 130, 246, 0.25);
++    border-color: #60a5fa;
++}
++
++.path-browser-actions {
++    display: flex;
++    gap: 0.75rem;
++    justify-content: flex-end;
++    margin-top: 0.85rem;
++}
++
++.path-browser-error {
++    background: rgba(239, 68, 68, 0.12);
++    border: 1px solid rgba(239, 68, 68, 0.5);
++    border-radius: 0.4rem;
++    color: #fecaca;
++    margin-bottom: 0.75rem;
++    padding: 0.65rem;
++}
++
++.path-browser-empty {
++    color: var(--text-secondary);
++    padding: 1rem;
++    text-align: center;
++}
+ .sidebar-history {
+     margin-top: 1.2rem;
+ }

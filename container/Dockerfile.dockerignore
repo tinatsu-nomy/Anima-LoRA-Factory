@@ -1,0 +1,8 @@
+.git
+container/.env
+container/datasets/**
+container/models/**
+container/output/**
+container/state/**
+**/__pycache__
+**/*.pyc

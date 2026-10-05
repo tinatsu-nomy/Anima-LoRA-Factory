@@ -1,0 +1,42 @@
+services:
+  anima-lora-factory:
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+      args:
+        UPSTREAM_ARCHIVE: ${UPSTREAM_ARCHIVE:-Anima-LoRA-Factory-v5.1.zip}
+        UPSTREAM_DIRECTORY: ${UPSTREAM_DIRECTORY:-Anima-LoRA-Factory-v5.1}
+        UPSTREAM_SHA256: ${UPSTREAM_SHA256:-6d79ca7f7ecea0f3972605babc06ef91b97787625ea50a2fba7a7c1a9e6ccb8b}
+        CUDA_IMAGE: ${CUDA_IMAGE:-nvidia/cuda:12.8.0-runtime-ubuntu22.04}
+        TORCH_SPEC: ${TORCH_SPEC:-torch==2.11.0}
+        TORCHVISION_SPEC: ${TORCHVISION_SPEC:-torchvision==0.26.0}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
+    image: anima-lora-factory:5.1-cuda
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+#    gpus: all
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      APP_PORT: "8000"
+      HOME: /app/data
+      USER: anima
+      LOGNAME: anima
+      XDG_CACHE_HOME: /app/data/cache
+      TORCHINDUCTOR_CACHE_DIR: /app/data/torchinductor
+      HF_HOME: /app/data/huggingface
+    volumes:
+      - ${DATASET_DIR:-./datasets}:/workspace/datasets:rw
+      - ${MODEL_DIR:-./models}:/workspace/models:ro
+      - ${OUTPUT_DIR:-./output}:/workspace/output:rw
+      - ${STATE_DIR:-./state}:/app/data:rw
+    shm_size: "8gb"
+    init: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]

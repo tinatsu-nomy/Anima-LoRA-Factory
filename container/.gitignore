@@ -1,0 +1,9 @@
+.env
+datasets/*
+models/*
+output/*
+state/*
+!datasets/.gitkeep
+!models/.gitkeep
+!output/.gitkeep
+!state/.gitkeep
